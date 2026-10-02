@@ -1,6 +1,6 @@
 # aznar-api — shared backend for AZONE and APAY
 
-Express 5 + TypeScript + MongoDB (Mongoose). One API, two route groups:
+Express 5 + TypeScript + **Supabase (PostgreSQL)** via Drizzle ORM. One API, two route groups:
 
 | Prefix   | Used by | Who can call it |
 |----------|---------|-----------------|
@@ -10,24 +10,40 @@ Express 5 + TypeScript + MongoDB (Mongoose). One API, two route groups:
 
 The payroll engine (`src/lib/payroll.ts`) runs **here**. APAY only displays results.
 
-## Run locally (PowerShell)
+## Connect to your Supabase project
+
+1. In Supabase, click **Connect** (top bar) → **Connection string**. Copy two strings, replacing
+   `[YOUR-PASSWORD]` with your database password (Project Settings → Database → reset it if you don't know it):
+   - **Transaction pooler** (port **6543**) → `DATABASE_URL` — used by the API
+   - **Session pooler** (port **5432**) → `DIRECT_URL` — used for migrations and seeding
+2. Put them in `aznar-api\.env` (copy `.env.example` if it doesn't exist).
+3. Create the tables, load demo data, start the API:
 
 ```powershell
 cd C:\Users\forrosuelo\aznar\aznar-api
-copy .env.example .env    # then set JWT_SECRET to a long random string
 npm install
-npm run dev               # http://localhost:4000
+npm run db:migrate          # creates the 13 tables in Supabase (public schema)
+npm run seed -- --yes       # DELETES everything, then loads demo data
+npm run dev                 # http://localhost:4000
 ```
 
-With `MONGODB_URI` empty, `npm run dev` starts an **in-memory MongoDB** (a single-node replica set, so transactions
-work) and fills it with demo data on every start. Nothing is saved between restarts. To keep data, point
-`MONGODB_URI` at MongoDB Atlas (or a local replica set) and run `npm run seed` once.
+Refresh **Database → Tables** in Supabase and you'll see them.
+
+Without `DATABASE_URL`, `npm run dev` runs an **in-process Postgres (PGlite)** with demo data instead — handy
+offline, but nothing is saved between restarts.
 
 Then start the two frontends with `VITE_API_MODE=http` and `VITE_API_URL=http://localhost:4000` in their `.env`.
 
+### Supabase security note
+
+Every table has **Row Level Security enabled with no policies**. That blocks Supabase's public Data API
+(the `anon`/`authenticated` keys) from reading payroll data. The API connects as the database owner, which
+bypasses RLS. Don't add RLS policies unless you intend the frontends to query Supabase directly — they shouldn't.
+Never put the database password or service-role key in a frontend.
+
 ### Demo accounts
 
-Password for all: the `SEED_PASSWORD` in `.env` (default `Aznar@2026`).
+Password for all: `SEED_PASSWORD` in `.env` (default `Aznar@2026`). For local/demo use only.
 
 | Email | App | Role |
 |---|---|---|
@@ -37,15 +53,15 @@ Password for all: the `SEED_PASSWORD` in `.env` (default `Aznar@2026`).
 | `finance@aznar.com` | APAY (and AZONE as Jose) | Finance |
 | `management@aznar.com` | APAY (and AZONE as Nicole) | Management |
 
-These are demo credentials for local development only. Change or remove them before real use.
-
 ## Scripts
 
 | Script | What it does |
 |---|---|
-| `npm run dev` | API with auto-reload (in-memory DB if no `MONGODB_URI`) |
-| `npm run seed` | Wipe and re-seed the database in `MONGODB_URI` (refuses in production) |
-| `npm test` | Payroll engine + API integration tests (in-memory MongoDB) |
+| `npm run dev` | API with auto-reload (in-memory Postgres if no `DATABASE_URL`) |
+| `npm run db:generate` | After editing `src/db/schema.ts`: write a new SQL migration into `drizzle/` |
+| `npm run db:migrate` | Apply pending migrations to Supabase (`DIRECT_URL`) |
+| `npm run seed -- --yes` | Wipe and re-seed the database with demo data |
+| `npm test` | Payroll engine + API integration tests (in-memory Postgres) |
 | `npm run typecheck` | TypeScript check |
 
 ## How the rules are enforced
@@ -53,13 +69,13 @@ These are demo credentials for local development only. Change or remove them bef
 - **Login**: bcrypt password hashes, generic error messages, rate-limited (20 tries / 15 min). The role always comes
   from the account — the role APAY's demo picker sends is ignored.
 - **Tokens**: JWT signed with `JWT_SECRET`, 8-hour expiry, and bound to one app (`aud: azone` or `aud: apay`).
-  An AZONE token is rejected on APAY routes.
 - **Permissions**: `src/lib/permissions.ts` (same map as the APAY UI). Every APAY write checks one.
 - **Maker–checker**: the person who computed a payroll can't approve it.
 - **Payroll states**: `draft → computed → review → approved → released`. Approved payroll is locked.
-  Compute and release run in **MongoDB transactions**, so a cut-off is never half-updated.
-- **Payslips are frozen**: each payroll line stores a snapshot of the employee (name, department, salary) taken at compute time.
-- **Money**: stored as `Decimal128`, calculated with `decimal.js`, returned as `"24500.00"` strings.
+  Compute and release run in **Postgres transactions** with a row lock on the period, so a cut-off is never
+  half-updated and two people can't process it at once.
+- **Payslips are frozen**: each payroll line stores a snapshot of the employee taken at compute time.
+- **Money**: `numeric(12,2)` columns, `decimal.js` math, returned as `"24500.00"` strings.
 - **Privacy**: AZONE never returns salary; government IDs and bank accounts are masked.
 - **Time zone**: all business dates use Asia/Manila, whatever the server's time zone.
 - **On release**: loan balances are reduced, every employee gets a "payslip ready" notification in AZONE, and an audit entry is written.
@@ -92,27 +108,25 @@ GET   /apay/audit
 GET   /health
 ```
 
-## Deploy (Vercel + MongoDB Atlas)
+## Deploy on Vercel
 
-1. Create an Atlas cluster (it's a replica set by default, so transactions work). Add a database user and allow
-   Vercel's IPs (or `0.0.0.0/0` with a strong password).
-2. Push this repo to GitHub and import it in Vercel. `vercel.json` routes every request to `api/index.ts`.
-3. Set environment variables in Vercel: `MONGODB_URI`, `JWT_SECRET`, `CORS_ORIGINS`
-   (e.g. `https://azone.aznar.com,https://apay.aznar.com`), `NODE_ENV=production`.
-4. Seed once from your machine against Atlas: `MONGODB_URI=... npm run seed` (only for a demo database).
-5. In each frontend's Vercel project set `VITE_API_MODE=http` and `VITE_API_URL=https://api.aznar.com`.
+1. Push this repo to GitHub and import it in Vercel. `vercel.json` routes every request to `api/index.ts`.
+2. Environment variables: `DATABASE_URL` (Transaction pooler, 6543), `JWT_SECRET`,
+   `CORS_ORIGINS` (e.g. `https://azone.aznar.com,https://apay.aznar.com`), `NODE_ENV=production`.
+3. Run `npm run db:migrate` from your machine whenever the schema changes.
+4. In each frontend's Vercel project: `VITE_API_MODE=http`, `VITE_API_URL=https://api.aznar.com`.
 
-The serverless entry reuses one MongoDB connection across warm invocations (`src/db.ts`).
 A company-use deployment needs Vercel's Pro plan.
 
 ## Structure
 
 ```
 api/index.ts            Vercel entry
+drizzle/                SQL migrations (generated from src/db/schema.ts)
 src/app.ts              Express app (helmet, CORS, JSON limit, routes, errors)
-src/server.ts           Local server (+ in-memory MongoDB)
+src/server.ts           Local server (+ in-memory Postgres)
 src/config.ts           Validated environment
-src/models/             Mongoose schemas
+src/db/                 Drizzle schema, connection, migrate script
 src/routes/             auth, azone, apay
 src/services/           payroll (compute/approve/release), attendance, notifications, audit, serializers
 src/lib/                payroll engine, dates (Asia/Manila), permissions, money

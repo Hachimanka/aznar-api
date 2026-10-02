@@ -1,5 +1,6 @@
-import type { Types } from 'mongoose'
-import { Attendance, Leave, Overtime } from '../models/index.js'
+import { and, between, eq, gte, inArray, lte } from 'drizzle-orm'
+import { db, type Exec } from '../db/index.js'
+import { attendance, leaves, overtime } from '../db/schema.js'
 import { eachDay, isWeekend, manilaDate, manilaMinutes } from '../lib/dates.js'
 import type { OvertimeKind } from '../lib/payroll.js'
 import { getHolidays, getPayrollSettings } from './core.js'
@@ -7,14 +8,13 @@ import { getHolidays, getPayrollSettings } from './core.js'
 export type DayStatus = 'present' | 'late' | 'absent' | 'leave' | 'rest' | 'holiday'
 
 type AttendanceRecord = {
-  date: string
-  timeIn?: Date | null
-  breakOut?: Date | null
-  breakIn?: Date | null
-  timeOut?: Date | null
+  timeIn: Date | null
+  breakOut: Date | null
+  breakIn: Date | null
+  timeOut: Date | null
 }
 
-type LeaveLite = { start: string; end: string; paid: boolean; type: string }
+type LeaveLite = { startDate: string; endDate: string; paid: boolean }
 
 /** Minutes late after the grace period (0 if within grace). */
 export function lateMinutes(timeIn: Date, shiftStart: number, grace: number) {
@@ -28,16 +28,23 @@ export function hoursWorked(r: AttendanceRecord) {
   return Math.max(0, Math.round(((r.timeOut.getTime() - r.timeIn.getTime() - breakMs) / 36e5) * 10) / 10)
 }
 
-const coveredBy = (day: string, leaves: LeaveLite[]) => leaves.find((l) => l.start <= day && day <= l.end)
+const coveredBy = (day: string, list: LeaveLite[]) => list.find((l) => l.startDate <= day && day <= l.endDate)
+const overlapping = (start: string, end: string) => and(lte(leaves.startDate, end), gte(leaves.endDate, start))
 
 /** Day-by-day records for one employee (AZONE DTR). Only days up to today. */
-export async function employeeDays(employeeId: string | Types.ObjectId, start: string, end: string) {
+export async function employeeDays(employeeId: string, start: string, end: string) {
   const today = manilaDate()
   const last = end < today ? end : today
   if (start > last) return []
-  const [records, leaves, holidays, settings] = await Promise.all([
-    Attendance.find({ employeeId, date: { $gte: start, $lte: last } }).lean(),
-    Leave.find({ employeeId, status: 'approved', start: { $lte: last }, end: { $gte: start } }).lean(),
+  const [records, approved, holidays, settings] = await Promise.all([
+    db()
+      .select()
+      .from(attendance)
+      .where(and(eq(attendance.employeeId, employeeId), between(attendance.date, start, last))),
+    db()
+      .select()
+      .from(leaves)
+      .where(and(eq(leaves.employeeId, employeeId), eq(leaves.status, 'approved'), overlapping(start, last))),
     getHolidays(),
     getPayrollSettings(),
   ])
@@ -47,7 +54,7 @@ export async function employeeDays(employeeId: string | Types.ObjectId, start: s
     const r = byDate.get(date)
     let status: DayStatus
     if (r?.timeIn) status = lateMinutes(r.timeIn, settings.shiftStartMinutes, settings.graceMinutes) ? 'late' : 'present'
-    else if (coveredBy(date, leaves)) status = 'leave'
+    else if (coveredBy(date, approved)) status = 'leave'
     else if (holidays.has(date)) status = 'holiday'
     else if (isWeekend(date)) status = 'rest'
     else status = 'absent'
@@ -78,22 +85,31 @@ export type PeriodAttendance = {
  * Attendance summary per employee for a cut-off — the payroll input.
  * Working days still in the future count as present (payroll is often prepared before the cut-off ends).
  */
-export async function periodAttendance(employeeIds: Types.ObjectId[], start: string, end: string) {
+export async function periodAttendance(employeeIds: string[], start: string, end: string, q: Exec = db()) {
+  const out = new Map<string, PeriodAttendance>()
+  if (!employeeIds.length) return out
   const today = manilaDate()
-  const [records, leaves, overtime, holidays, settings] = await Promise.all([
-    Attendance.find({ employeeId: { $in: employeeIds }, date: { $gte: start, $lte: end } }).lean(),
-    Leave.find({ employeeId: { $in: employeeIds }, status: 'approved', start: { $lte: end }, end: { $gte: start } }).lean(),
-    Overtime.find({ employeeId: { $in: employeeIds }, status: 'approved', date: { $gte: start, $lte: end } }).lean(),
-    getHolidays(),
-    getPayrollSettings(),
+  const [records, approved, ot, holidays, settings] = await Promise.all([
+    q
+      .select()
+      .from(attendance)
+      .where(and(inArray(attendance.employeeId, employeeIds), between(attendance.date, start, end))),
+    q
+      .select()
+      .from(leaves)
+      .where(and(inArray(leaves.employeeId, employeeIds), eq(leaves.status, 'approved'), overlapping(start, end))),
+    q
+      .select()
+      .from(overtime)
+      .where(and(inArray(overtime.employeeId, employeeIds), eq(overtime.status, 'approved'), between(overtime.date, start, end))),
+    getHolidays(q),
+    getPayrollSettings(q),
   ])
   const workdays = eachDay(start, end).filter((d) => !isWeekend(d) && !holidays.has(d))
-  const recordKey = (id: unknown, date: string) => `${id}|${date}`
-  const byKey = new Map(records.map((r) => [recordKey(r.employeeId, r.date), r]))
+  const byKey = new Map(records.map((r) => [`${r.employeeId}|${r.date}`, r]))
 
-  const out = new Map<string, PeriodAttendance>()
   for (const id of employeeIds) {
-    const myLeaves = leaves.filter((l) => l.employeeId.equals(id))
+    const mine = approved.filter((l) => l.employeeId === id)
     const s: PeriodAttendance = {
       workingDays: workdays.length,
       daysPresent: 0,
@@ -105,8 +121,8 @@ export async function periodAttendance(employeeIds: Types.ObjectId[], start: str
       overtimeHours: 0,
     }
     for (const day of workdays) {
-      const leave = coveredBy(day, myLeaves)
-      const r = byKey.get(recordKey(id, day))
+      const leave = coveredBy(day, mine)
+      const r = byKey.get(`${id}|${day}`)
       if (leave) leave.paid ? s.paidLeaveDays++ : s.unpaidLeaveDays++
       else if (r?.timeIn) {
         s.daysPresent++
@@ -115,17 +131,10 @@ export async function periodAttendance(employeeIds: Types.ObjectId[], start: str
       else s.daysPresent++
     }
     const byKind = new Map<OvertimeKind, number>()
-    for (const ot of overtime.filter((o) => o.employeeId.equals(id)))
-      byKind.set(ot.kind as OvertimeKind, (byKind.get(ot.kind as OvertimeKind) ?? 0) + ot.hours)
+    for (const o of ot.filter((o) => o.employeeId === id)) byKind.set(o.kind, (byKind.get(o.kind) ?? 0) + o.hours)
     s.overtime = [...byKind].map(([kind, hours]) => ({ kind, hours }))
     s.overtimeHours = s.overtime.reduce((t, o) => t + o.hours, 0)
-    out.set(String(id), s)
+    out.set(id, s)
   }
   return out
-}
-
-/** Working days between two dates, excluding weekends and company holidays. */
-export async function countWorkdays(start: string, end: string) {
-  const holidays = await getHolidays()
-  return eachDay(start, end).filter((d) => !isWeekend(d) && !holidays.has(d)).length
 }

@@ -1,13 +1,11 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import request from 'supertest'
-import { MongoMemoryReplSet } from 'mongodb-memory-server'
 import { createApp } from '../src/app.js'
-import { connectDb, disconnectDb } from '../src/db.js'
+import { connectMemoryDb, disconnectDb } from '../src/db/index.js'
 import { seedDatabase } from '../src/seed/seed.js'
 import { sum } from '../src/lib/payroll.js'
 
 const PASSWORD = 'Test@12345'
-let replSet: MongoMemoryReplSet
 const app = createApp()
 
 async function login(email: string, appName: 'azone' | 'apay') {
@@ -17,14 +15,13 @@ async function login(email: string, appName: 'azone' | 'apay') {
 }
 
 beforeAll(async () => {
-  replSet = await MongoMemoryReplSet.create({ replSet: { count: 1, storageEngine: 'wiredTiger' } })
-  await connectDb(replSet.getUri('aznar-test'))
+  // Real Postgres (PGlite) with the same migrations Supabase gets
+  await connectMemoryDb()
   await seedDatabase({ password: PASSWORD })
 })
 
 afterAll(async () => {
   await disconnectDb()
-  await replSet?.stop()
 })
 
 describe('auth', () => {
@@ -90,9 +87,16 @@ describe('AZONE', () => {
     expect(res.status).toBe(400)
   })
 
-  it('returns leave balances and announcements', async () => {
+  it('returns leave balances and only published announcements', async () => {
     expect((await get('/azone/leaves/balances')).body.map((b: { type: string }) => b.type)).toEqual(['vacation', 'sick', 'emergency', 'birthday'])
     expect((await get('/azone/announcements')).body.every((a: { title: string }) => a.title !== '13th Month Pay Schedule')).toBe(true)
+  })
+
+  it('returns a DTR month and a today record', async () => {
+    const today = (await get('/azone/attendance/today')).body
+    expect(today.date).toMatch(/^\d{4}-\d{2}-\d{2}$/)
+    const month = (await get(`/azone/attendance?month=${today.date.slice(0, 7)}`)).body
+    expect(month.at(-1).date).toBe(today.date)
   })
 })
 
@@ -151,6 +155,11 @@ describe('APAY payroll cycle', () => {
     expect(notes[0].kind).toBe('payslip')
 
     expect((await as(admin).get('/apay/audit')).body[0].action).toBe('Released payroll')
+  })
+
+  it('amortizes loans on release', async () => {
+    const loan = (await as(admin).get('/apay/adjustments')).body.find((a: { name: string }) => a.name === 'SSS Salary Loan')
+    expect(loan.balance).toBe('13750.00')
   })
 
   it('blocks Finance from changing settings', async () => {

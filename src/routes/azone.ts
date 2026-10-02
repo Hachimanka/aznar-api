@@ -1,8 +1,9 @@
 import { Router } from 'express'
-import mongoose from 'mongoose'
+import { and, desc, eq, gte, inArray, lte, ne, or } from 'drizzle-orm'
 import { z } from 'zod'
-import { Announcement, Attendance, Employee, EmployeeRequest, Leave, Notification, PayrollLine, PayrollPeriod } from '../models/index.js'
-import { badRequest, conflict, handler, isoDay, notFound, objectId, parse } from '../lib/http.js'
+import { db } from '../db/index.js'
+import { announcements, attendance, employeeRequests, employees, leaves, notifications, payrollLines, payrollPeriods } from '../db/schema.js'
+import { badRequest, conflict, handler, isoDay, notFound, parse, uuid } from '../lib/http.js'
 import { eachDay, isWeekend, lastDayOfMonth, manilaDate } from '../lib/dates.js'
 import { employeeIdOf, requireAuth } from '../middleware/auth.js'
 import { employeeDays } from '../services/attendance.js'
@@ -13,15 +14,17 @@ import { azoneAnnouncement, azoneDay, azoneEmployee, azoneLeave, azoneNotificati
 export const azoneRouter = Router()
 azoneRouter.use(requireAuth('azone'))
 
+async function me(employeeId: string) {
+  const [e] = await db().select().from(employees).where(eq(employees.id, employeeId))
+  if (!e) throw notFound('Employee')
+  return e
+}
+
 /* --------------------------------- Profile --------------------------------- */
 
 azoneRouter.get(
   '/me',
-  handler(async (req) => {
-    const e = await Employee.findById(employeeIdOf(req)).lean()
-    if (!e) throw notFound('Employee')
-    return azoneEmployee(e)
-  }),
+  handler(async (req) => azoneEmployee(await me(employeeIdOf(req)))),
 )
 
 const contactSchema = z.object({
@@ -38,7 +41,17 @@ azoneRouter.patch(
   '/me/contact',
   handler(async (req) => {
     const input = parse(contactSchema, req.body)
-    const e = await Employee.findByIdAndUpdate(employeeIdOf(req), { $set: input }, { new: true }).lean()
+    const [e] = await db()
+      .update(employees)
+      .set({
+        phone: input.phone,
+        address: input.address,
+        emergencyName: input.emergencyContact.name,
+        emergencyRelation: input.emergencyContact.relation,
+        emergencyPhone: input.emergencyContact.phone,
+      })
+      .where(eq(employees.id, employeeIdOf(req)))
+      .returning()
     if (!e) throw notFound('Employee')
     return azoneEmployee(e)
   }),
@@ -49,22 +62,32 @@ azoneRouter.patch(
 azoneRouter.get(
   '/payslips',
   handler(async (req) => {
-    const released = await PayrollPeriod.find({ status: 'released' }).sort({ end: -1 }).lean()
-    const lines = await PayrollLine.find({ employeeId: employeeIdOf(req), periodId: { $in: released.map((p) => p._id) } }).lean()
-    return released.flatMap((p) => {
-      const line = lines.find((l) => l.periodId.equals(p._id))
-      return line ? [azonePayslip(line, p)] : []
-    })
+    const rows = await db()
+      .select({ line: payrollLines, period: payrollPeriods })
+      .from(payrollLines)
+      .innerJoin(payrollPeriods, eq(payrollLines.periodId, payrollPeriods.id))
+      .where(and(eq(payrollLines.employeeId, employeeIdOf(req)), eq(payrollPeriods.status, 'released')))
+      .orderBy(desc(payrollPeriods.endDate))
+    return rows.map((r) => azonePayslip(r.line, r.period))
   }),
 )
 
 azoneRouter.get(
   '/payslips/:id',
   handler(async (req) => {
-    const line = await PayrollLine.findOne({ _id: objectId(req.params.id, 'Payslip'), employeeId: employeeIdOf(req) }).lean()
-    const period = line && (await PayrollPeriod.findOne({ _id: line.periodId, status: 'released' }).lean())
-    if (!line || !period) throw notFound('Payslip')
-    return azonePayslip(line, period)
+    const [row] = await db()
+      .select({ line: payrollLines, period: payrollPeriods })
+      .from(payrollLines)
+      .innerJoin(payrollPeriods, eq(payrollLines.periodId, payrollPeriods.id))
+      .where(
+        and(
+          eq(payrollLines.id, uuid(req.params.id, 'Payslip')),
+          eq(payrollLines.employeeId, employeeIdOf(req)),
+          eq(payrollPeriods.status, 'released'),
+        ),
+      )
+    if (!row) throw notFound('Payslip')
+    return azonePayslip(row.line, row.period)
   }),
 )
 
@@ -87,12 +110,21 @@ azoneRouter.post(
     const { kind } = parse(z.object({ kind: z.enum(punchOrder) }), req.body)
     const employeeId = employeeIdOf(req)
     const today = manilaDate()
-    const record = (await Attendance.findOne({ employeeId, date: today })) ?? new Attendance({ employeeId, date: today, source: 'azone' })
-    // Punches must happen in order: time in → break out → break in → time out
-    const next = punchOrder.find((k) => !record[k])
-    if (next !== kind) throw conflict(next ? `Next punch should be ${next}` : 'You have already timed out today')
-    record[kind] = new Date()
-    await record.save()
+    await db().transaction(async (tx) => {
+      await tx.insert(attendance).values({ employeeId, date: today, source: 'azone' }).onConflictDoNothing()
+      const [record] = await tx
+        .select()
+        .from(attendance)
+        .where(and(eq(attendance.employeeId, employeeId), eq(attendance.date, today)))
+        .for('update')
+      // Punches must happen in order: time in → break out → break in → time out
+      const next = punchOrder.find((k) => !record[k])
+      if (next !== kind) throw conflict(next ? `Next punch should be ${next}` : 'You have already timed out today')
+      await tx
+        .update(attendance)
+        .set({ [kind]: new Date() })
+        .where(eq(attendance.id, record.id))
+    })
     const [day] = await employeeDays(employeeId, today, today)
     return azoneDay(day)
   }),
@@ -133,15 +165,23 @@ const leaveLabels = { vacation: 'Vacation Leave', sick: 'Sick Leave', emergency:
 type PaidLeave = keyof typeof leaveLabels
 
 async function leaveBalances(employeeId: string) {
-  const e = await Employee.findById(employeeId).lean()
-  if (!e) throw notFound('Employee')
+  const e = await me(employeeId)
+  const credits: Record<PaidLeave, number> = {
+    vacation: e.vacationCredits,
+    sick: e.sickCredits,
+    emergency: e.emergencyCredits,
+    birthday: e.birthdayCredits,
+  }
   const year = manilaDate().slice(0, 4)
-  const taken = await Leave.find({ employeeId, status: { $in: ['approved', 'pending'] }, start: { $gte: `${year}-01-01` } }).lean()
+  const taken = await db()
+    .select()
+    .from(leaves)
+    .where(and(eq(leaves.employeeId, employeeId), inArray(leaves.status, ['approved', 'pending']), gte(leaves.startDate, `${year}-01-01`)))
   return (Object.keys(leaveLabels) as PaidLeave[]).map((type) => {
-    const total = e.leaveCredits?.[type] ?? 0
-    const used = taken.filter((l) => l.type === type && l.status === 'approved').reduce((s, l) => s + l.days, 0)
-    const pending = taken.filter((l) => l.type === type && l.status === 'pending').reduce((s, l) => s + l.days, 0)
-    return { type, label: leaveLabels[type], total, used, available: Math.max(0, total - used - pending) }
+    const total = credits[type]
+    const days = (status: string) => taken.filter((l) => l.type === type && l.status === status).reduce((s, l) => s + l.days, 0)
+    const used = days('approved')
+    return { type, label: leaveLabels[type], total, used, available: Math.max(0, total - used - days('pending')) }
   })
 }
 
@@ -154,9 +194,11 @@ azoneRouter.get(
   '/leaves',
   handler(async (req) =>
     (
-      await Leave.find({ employeeId: employeeIdOf(req) })
-        .sort({ createdAt: -1 })
-        .lean()
+      await db()
+        .select()
+        .from(leaves)
+        .where(eq(leaves.employeeId, employeeIdOf(req)))
+        .orderBy(desc(leaves.createdAt))
     ).map(azoneLeave),
   ),
 )
@@ -182,20 +224,26 @@ azoneRouter.post(
     const balance = (await leaveBalances(employeeId)).find((b) => b.type === input.type)!
     if (days > balance.available) throw badRequest(`Not enough ${balance.label.toLowerCase()} credits (${balance.available} left)`)
 
-    const overlap = await Leave.exists({ employeeId, status: { $ne: 'rejected' }, start: { $lte: input.endDate }, end: { $gte: input.startDate } })
+    const [overlap] = await db()
+      .select({ id: leaves.id })
+      .from(leaves)
+      .where(
+        and(
+          eq(leaves.employeeId, employeeId),
+          ne(leaves.status, 'rejected'),
+          lte(leaves.startDate, input.endDate),
+          gte(leaves.endDate, input.startDate),
+        ),
+      )
+      .limit(1)
     if (overlap) throw conflict('You already have a leave filed on these dates')
 
-    const leave = await Leave.create({
-      employeeId,
-      type: input.type,
-      start: input.startDate,
-      end: input.endDate,
-      days,
-      reason: input.reason,
-      paid: true,
-    })
+    const [leave] = await db()
+      .insert(leaves)
+      .values({ employeeId, type: input.type, startDate: input.startDate, endDate: input.endDate, days, reason: input.reason, paid: true })
+      .returning()
     res.status(201)
-    return azoneLeave(leave.toObject())
+    return azoneLeave(leave)
   }),
 )
 
@@ -213,9 +261,11 @@ azoneRouter.get(
   '/requests',
   handler(async (req) =>
     (
-      await EmployeeRequest.find({ employeeId: employeeIdOf(req) })
-        .sort({ createdAt: -1 })
-        .lean()
+      await db()
+        .select()
+        .from(employeeRequests)
+        .where(eq(employeeRequests.employeeId, employeeIdOf(req)))
+        .orderBy(desc(employeeRequests.createdAt))
     ).map(azoneRequest),
   ),
 )
@@ -227,31 +277,31 @@ azoneRouter.post(
       z.object({ kind: z.enum(['coe', 'schedule_change', 'overtime', 'reimbursement', 'other']), details: z.string().trim().min(5).max(1000) }),
       req.body,
     )
-    const r = await EmployeeRequest.create({
-      employeeId: employeeIdOf(req),
-      kind: input.kind,
-      title: requestTitles[input.kind],
-      details: input.details,
-    })
+    const [r] = await db()
+      .insert(employeeRequests)
+      .values({ employeeId: employeeIdOf(req), kind: input.kind, title: requestTitles[input.kind], details: input.details })
+      .returning()
     res.status(201)
-    return azoneRequest(r.toObject())
+    return azoneRequest(r)
   }),
 )
 
 /* ------------------------------- Announcements ------------------------------- */
 
-async function visibleAnnouncements(employeeId: string): Promise<mongoose.QueryFilter<unknown>> {
-  const e = await Employee.findById(employeeId).select('department').lean()
-  return { status: 'published', audience: { $in: ['all', e?.department ?? ''] } }
+async function visibleTo(employeeId: string) {
+  const e = await me(employeeId)
+  return and(eq(announcements.status, 'published'), or(eq(announcements.audience, 'all'), eq(announcements.audience, e.department)))
 }
 
 azoneRouter.get(
   '/announcements',
   handler(async (req) => {
-    const list = await Announcement.find(await visibleAnnouncements(employeeIdOf(req)))
-      .sort({ pinned: -1, publishedAt: -1 })
+    const list = await db()
+      .select()
+      .from(announcements)
+      .where(await visibleTo(employeeIdOf(req)))
+      .orderBy(desc(announcements.pinned), desc(announcements.publishedAt))
       .limit(50)
-      .lean()
     return list.map(azoneAnnouncement)
   }),
 )
@@ -259,7 +309,10 @@ azoneRouter.get(
 azoneRouter.get(
   '/announcements/:id',
   handler(async (req) => {
-    const a = await Announcement.findOne({ _id: objectId(req.params.id, 'Announcement'), ...(await visibleAnnouncements(employeeIdOf(req))) }).lean()
+    const [a] = await db()
+      .select()
+      .from(announcements)
+      .where(and(eq(announcements.id, uuid(req.params.id, 'Announcement')), await visibleTo(employeeIdOf(req))))
     if (!a) throw notFound('Announcement')
     return azoneAnnouncement(a)
   }),
@@ -271,10 +324,12 @@ azoneRouter.get(
   '/notifications',
   handler(async (req) =>
     (
-      await Notification.find({ employeeId: employeeIdOf(req) })
-        .sort({ createdAt: -1 })
+      await db()
+        .select()
+        .from(notifications)
+        .where(eq(notifications.employeeId, employeeIdOf(req)))
+        .orderBy(desc(notifications.createdAt))
         .limit(50)
-        .lean()
     ).map(azoneNotification),
   ),
 )
@@ -283,8 +338,21 @@ azoneRouter.post(
   '/notifications/read',
   handler(async (req, res) => {
     const { ids } = parse(z.object({ ids: z.array(z.string()).max(100).optional() }), req.body ?? {})
-    const filter = { employeeId: employeeIdOf(req), ...(ids ? { _id: { $in: ids.map((i) => objectId(i, 'Notification')) } } : {}) }
-    await Notification.updateMany(filter, { $set: { read: true } })
+    const mine = eq(notifications.employeeId, employeeIdOf(req))
+    await db()
+      .update(notifications)
+      .set({ read: true })
+      .where(
+        ids
+          ? and(
+              mine,
+              inArray(
+                notifications.id,
+                ids.map((i) => uuid(i, 'Notification')),
+              ),
+            )
+          : mine,
+      )
     res.status(204).end()
   }),
 )

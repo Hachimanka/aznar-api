@@ -1,6 +1,7 @@
 import type { Request } from 'express'
-import type { ClientSession, Types } from 'mongoose'
-import { Audit, Notification, Setting } from '../models/index.js'
+import { eq } from 'drizzle-orm'
+import { db, type Exec } from '../db/index.js'
+import { auditLog, notifications, settings } from '../db/schema.js'
 
 /* --------------------------------- Settings --------------------------------- */
 
@@ -40,26 +41,26 @@ export const defaultPayrollSettings: PayrollSettings = {
   shiftStartMinutes: 8 * 60,
 }
 
-export async function getSetting<T>(key: 'payroll' | 'company', fallback: T): Promise<T> {
-  const doc = await Setting.findOne({ key }).lean()
-  return doc ? ({ ...fallback, ...(doc.value as object) } as T) : fallback
+export async function getSetting<T>(key: 'payroll' | 'company', fallback: T, q: Exec = db()): Promise<T> {
+  const [row] = await q.select().from(settings).where(eq(settings.key, key))
+  return row ? ({ ...fallback, ...(row.value as object) } as T) : fallback
 }
 
-export const getPayrollSettings = () => getSetting<PayrollSettings>('payroll', defaultPayrollSettings)
+export const getPayrollSettings = (q?: Exec) => getSetting<PayrollSettings>('payroll', defaultPayrollSettings, q)
 
-export async function getHolidays() {
-  const company = await getSetting<CompanyInfo | null>('company', null)
+export async function getHolidays(q?: Exec) {
+  const company = await getSetting<CompanyInfo | null>('company', null, q)
   return new Set((company?.holidays ?? []).map((h) => h.date))
 }
 
 export async function saveSetting(key: string, value: unknown) {
-  await Setting.updateOne({ key }, { $set: { value } }, { upsert: true })
+  await db().insert(settings).values({ key, value }).onConflictDoUpdate({ target: settings.key, set: { value } })
 }
 
 /* ---------------------------------- Audit ---------------------------------- */
 
-export async function audit(req: Request, action: string, target: string, session?: ClientSession) {
-  await Audit.create([{ actor: req.auth?.name ?? 'System', actorId: req.auth?.userId, action, target }], { session })
+export async function audit(req: Request, action: string, target: string, q: Exec = db()) {
+  await q.insert(auditLog).values({ actor: req.auth?.name ?? 'System', actorId: req.auth?.userId, action, target })
 }
 
 /* ------------------------------ Notifications ------------------------------ */
@@ -72,10 +73,7 @@ type NotificationInput = {
 }
 
 /** Send the same notification to many employees (shows in their AZONE bell). */
-export async function notify(employeeIds: (string | Types.ObjectId)[], n: NotificationInput, session?: ClientSession) {
+export async function notify(employeeIds: string[], n: NotificationInput, q: Exec = db()) {
   if (!employeeIds.length) return
-  await Notification.insertMany(
-    employeeIds.map((employeeId) => ({ employeeId, ...n })),
-    { session },
-  )
+  await q.insert(notifications).values(employeeIds.map((employeeId) => ({ employeeId, ...n })))
 }

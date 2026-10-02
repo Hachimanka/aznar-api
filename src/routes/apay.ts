@@ -1,10 +1,10 @@
 import { Router, type Request } from 'express'
-import mongoose from 'mongoose'
+import { and, asc, desc, eq, inArray, lte, ne } from 'drizzle-orm'
 import { z } from 'zod'
-import { Adjustment, Announcement, Audit, Employee, Leave, Overtime, PayrollLine, PayrollPeriod } from '../models/index.js'
-import { forbidden, handler, isoDay, notFound, objectId, parse, pesoString } from '../lib/http.js'
-import { D128 } from '../lib/money.js'
-import { staffRoles } from '../lib/permissions.js'
+import { db } from '../db/index.js'
+import { adjustments, announcements, auditLog, employees, leaves, overtime, payrollLines, payrollPeriods } from '../db/schema.js'
+import { forbidden, handler, isoDay, notFound, parse, pesoString, uuid } from '../lib/http.js'
+import { staffRoles, type StaffRole } from '../lib/permissions.js'
 import { auth, requireAny, requireAuth, requirePermission } from '../middleware/auth.js'
 import { periodAttendance } from '../services/attendance.js'
 import { audit, getPayrollSettings, notify, saveSetting } from '../services/core.js'
@@ -13,13 +13,15 @@ import { apayAdjustment, apayAnnouncement, apayAudit, apayEmployee, apayLeave, a
 
 /** HR / payroll operations. Staff accounts only; each write checks a permission. */
 export const apayRouter = Router()
-apayRouter.use(requireAuth('apay'), (req, _res, next) => (staffRoles.includes(auth(req).role as never) ? next() : next(forbidden())))
+apayRouter.use(requireAuth('apay'), (req, _res, next) => (staffRoles.includes(auth(req).role as StaffRole) ? next() : next(forbidden())))
 
-async function employeeIndex(ids?: unknown[]) {
-  const list = await Employee.find(ids ? { _id: { $in: ids } } : {})
-    .select('firstName lastName department')
-    .lean()
-  return new Map(list.map((e) => [String(e._id), e]))
+async function employeeIndex(ids?: string[]) {
+  if (ids && !ids.length) return new Map()
+  const list = await db()
+    .select({ id: employees.id, firstName: employees.firstName, lastName: employees.lastName, department: employees.department })
+    .from(employees)
+    .where(ids ? inArray(employees.id, [...new Set(ids)]) : undefined)
+  return new Map(list.map((e) => [e.id, e]))
 }
 
 /* --------------------------------- Employees --------------------------------- */
@@ -40,44 +42,50 @@ const employeeSchema = z.object({
   govIds: z.object({ sss: z.string().max(30), philhealth: z.string().max(30), pagibig: z.string().max(30), tin: z.string().max(30) }).optional(),
 })
 
+/** Masked values coming back from the UI (e.g. "••••1234") must never overwrite the real ones. */
+const real = (v: string | undefined) => (v && !v.includes('•') && v !== '—' ? v : undefined)
+
+function employeeValues(input: z.infer<typeof employeeSchema>) {
+  const { bank, govIds, email, ...rest } = input
+  const values = {
+    ...rest,
+    email: email.toLowerCase(),
+    bankName: real(bank?.name),
+    bankAccount: real(bank?.account),
+    sss: real(govIds?.sss),
+    philhealth: real(govIds?.philhealth),
+    pagibig: real(govIds?.pagibig),
+    tin: real(govIds?.tin),
+  }
+  return Object.fromEntries(Object.entries(values).filter(([, v]) => v !== undefined)) as typeof rest & { email: string }
+}
+
 apayRouter.get(
   '/employees',
-  handler(async () => (await Employee.find().sort({ lastName: 1 }).lean()).map(apayEmployee)),
+  handler(async () => (await db().select().from(employees).orderBy(asc(employees.lastName))).map(apayEmployee)),
 )
 
 apayRouter.get(
   '/employees/:id',
   handler(async (req) => {
-    const e = await Employee.findById(objectId(req.params.id, 'Employee')).lean()
+    const [e] = await db()
+      .select()
+      .from(employees)
+      .where(eq(employees.id, uuid(req.params.id, 'Employee')))
     if (!e) throw notFound('Employee')
     return apayEmployee(e)
   }),
 )
-
-/** Masked values coming back from the UI (e.g. "•••• 1234") must not overwrite the real ones. */
-function withoutMasked<T extends Record<string, string>>(obj: T | undefined) {
-  return obj ? Object.fromEntries(Object.entries(obj).filter(([, v]) => !v.includes('•') && v !== '—')) : undefined
-}
-
-function employeeUpdate(input: z.infer<typeof employeeSchema>) {
-  const { bank, govIds, monthlyBasic, ...rest } = input
-  const set: Record<string, unknown> = { ...rest, monthlyBasic: D128(monthlyBasic) }
-  for (const [k, v] of Object.entries(withoutMasked(bank) ?? {})) set[`bank.${k}`] = v
-  for (const [k, v] of Object.entries(withoutMasked(govIds) ?? {})) set[`govIds.${k}`] = v
-  return set
-}
 
 apayRouter.post(
   '/employees',
   requirePermission('employees.manage'),
   handler(async (req, res) => {
     const input = parse(employeeSchema, req.body)
-    const e = new Employee()
-    e.set(employeeUpdate(input))
-    await e.save()
-    await audit(req, 'Added employee', `${input.firstName} ${input.lastName}`)
+    const [e] = await db().insert(employees).values(employeeValues(input)).returning()
+    await audit(req, 'Added employee', `${e.firstName} ${e.lastName}`)
     res.status(201)
-    return apayEmployee(e.toObject())
+    return apayEmployee(e)
   }),
 )
 
@@ -86,11 +94,11 @@ apayRouter.put(
   requirePermission('employees.manage'),
   handler(async (req) => {
     const input = parse(employeeSchema, req.body)
-    const e = await Employee.findByIdAndUpdate(
-      objectId(req.params.id, 'Employee'),
-      { $set: employeeUpdate(input) },
-      { new: true, runValidators: true },
-    ).lean()
+    const [e] = await db()
+      .update(employees)
+      .set(employeeValues(input))
+      .where(eq(employees.id, uuid(req.params.id, 'Employee')))
+      .returning()
     if (!e) throw notFound('Employee')
     await audit(req, 'Updated employee', `${e.firstName} ${e.lastName}`)
     return apayEmployee(e)
@@ -103,12 +111,15 @@ apayRouter.get(
   '/periods',
   handler(async () => {
     await ensureCurrentPeriod()
-    return (await PayrollPeriod.find().sort({ end: -1 }).limit(48).lean()).map(apayPeriod)
+    return (await db().select().from(payrollPeriods).orderBy(desc(payrollPeriods.endDate)).limit(48)).map(apayPeriod)
   }),
 )
 
 async function findPeriod(req: Request) {
-  const p = await PayrollPeriod.findById(objectId(req.params.id, 'Payroll period')).lean()
+  const [p] = await db()
+    .select()
+    .from(payrollPeriods)
+    .where(eq(payrollPeriods.id, uuid(req.params.id, 'Payroll period')))
   if (!p) throw notFound('Payroll period')
   return p
 }
@@ -122,18 +133,20 @@ apayRouter.get(
   '/periods/:id/attendance',
   handler(async (req) => {
     const p = await findPeriod(req)
-    const employees = await Employee.find({ status: { $ne: 'resigned' }, hireDate: { $lte: p.end } })
-      .sort({ lastName: 1 })
-      .lean()
+    const staff = await db()
+      .select()
+      .from(employees)
+      .where(and(ne(employees.status, 'resigned'), lte(employees.hireDate, p.endDate)))
+      .orderBy(asc(employees.lastName))
     const summary = await periodAttendance(
-      employees.map((e) => e._id),
-      p.start,
-      p.end,
+      staff.map((e) => e.id),
+      p.startDate,
+      p.endDate,
     )
-    return employees.map((e) => {
-      const s = summary.get(String(e._id))!
+    return staff.map((e) => {
+      const s = summary.get(e.id)!
       return {
-        employeeId: String(e._id),
+        employeeId: e.id,
         employeeNo: e.employeeNo,
         name: `${e.firstName} ${e.lastName}`,
         department: e.department,
@@ -153,7 +166,7 @@ apayRouter.get(
   '/periods/:id/lines',
   handler(async (req) => {
     const p = await findPeriod(req)
-    return (await PayrollLine.find({ periodId: p._id }).sort({ name: 1 }).lean()).map(apayLine)
+    return (await db().select().from(payrollLines).where(eq(payrollLines.periodId, p.id)).orderBy(asc(payrollLines.name))).map(apayLine)
   }),
 )
 
@@ -161,18 +174,14 @@ apayRouter.post(
   '/periods/:id/compute',
   requirePermission('payroll.process'),
   handler(async (req) => {
-    const id = objectId(req.params.id, 'Payroll period')
-    const session = await mongoose.startSession()
-    try {
-      // Replacing every line of a cut-off happens all-or-nothing
-      await session.withTransaction(async () => {
-        const p = await computePeriod(id, { userId: auth(req).userId }, session)
-        await audit(req, 'Computed payroll', p.label, session)
-      })
-    } finally {
-      await session.endSession()
-    }
-    return apayPeriod((await PayrollPeriod.findById(id).lean())!)
+    const id = uuid(req.params.id, 'Payroll period')
+    // Replacing every line of a cut-off happens all-or-nothing
+    const period = await db().transaction(async (tx) => {
+      const p = await computePeriod(id, { userId: auth(req).userId }, tx)
+      await audit(req, 'Computed payroll', p.label, tx)
+      return p
+    })
+    return apayPeriod(period)
   }),
 )
 
@@ -188,18 +197,14 @@ apayRouter.post(
   requireAny('payroll.process', 'payroll.approve', 'payroll.release'),
   handler(async (req) => {
     const { status } = parse(z.object({ status: z.enum(['computed', 'review', 'approved', 'released']) }), req.body)
-    const id = objectId(req.params.id, 'Payroll period')
+    const id = uuid(req.params.id, 'Payroll period')
     const a = auth(req)
-    const session = await mongoose.startSession()
-    try {
-      await session.withTransaction(async () => {
-        const p = await transitionPeriod(id, status, { userId: a.userId, name: a.name, role: a.role }, session)
-        await audit(req, actionLabels[status], p.label, session)
-      })
-    } finally {
-      await session.endSession()
-    }
-    return apayPeriod((await PayrollPeriod.findById(id).lean())!)
+    const period = await db().transaction(async (tx) => {
+      const p = await transitionPeriod(id, status, { userId: a.userId, name: a.name, role: a.role }, tx)
+      await audit(req, actionLabels[status], p.label, tx)
+      return p
+    })
+    return apayPeriod(period)
   }),
 )
 
@@ -223,21 +228,23 @@ const adjustmentSchema = z
 apayRouter.get(
   '/adjustments',
   handler(async () => {
-    const list = await Adjustment.find().sort({ createdAt: -1 }).lean()
-    const names = new Map([...(await employeeIndex())].map(([id, e]) => [id, `${e.firstName} ${e.lastName}`]))
-    return list.map((a) => apayAdjustment(a, names))
+    const list = await db().select().from(adjustments).orderBy(desc(adjustments.createdAt))
+    const emps = await employeeIndex()
+    return list.map((a) => apayAdjustment(a, emps.get(a.employeeId)))
   }),
 )
 
 async function saveAdjustment(req: Request, id?: string) {
   const input = parse(adjustmentSchema, req.body)
-  const emp = await Employee.findById(objectId(input.employeeId, 'Employee')).lean()
+  const emp = (await employeeIndex([uuid(input.employeeId, 'Employee')])).get(input.employeeId)
   if (!emp) throw notFound('Employee')
-  const set = { ...input, amount: D128(input.amount), balance: input.balance ? D128(input.balance) : undefined }
-  const doc = id ? await Adjustment.findByIdAndUpdate(id, { $set: set }, { new: true }).lean() : (await Adjustment.create(set)).toObject()
+  const values = { ...input, balance: input.balance ?? null }
+  const [doc] = id
+    ? await db().update(adjustments).set(values).where(eq(adjustments.id, id)).returning()
+    : await db().insert(adjustments).values(values).returning()
   if (!doc) throw notFound('Adjustment')
   await audit(req, id ? `Updated ${input.kind}` : `Added ${input.kind}`, `${input.name} · ${emp.firstName} ${emp.lastName}`)
-  return apayAdjustment(doc, new Map([[String(emp._id), `${emp.firstName} ${emp.lastName}`]]))
+  return apayAdjustment(doc, emp)
 }
 
 apayRouter.post(
@@ -253,7 +260,7 @@ apayRouter.post(
 apayRouter.put(
   '/adjustments/:id',
   requirePermission('adjustments.manage'),
-  handler((req) => saveAdjustment(req, objectId(req.params.id, 'Adjustment'))),
+  handler((req) => saveAdjustment(req, uuid(req.params.id, 'Adjustment'))),
 )
 
 /* ---------------------------------- Overtime ---------------------------------- */
@@ -261,9 +268,9 @@ apayRouter.put(
 apayRouter.get(
   '/overtime',
   handler(async () => {
-    const list = await Overtime.find().sort({ date: -1 }).limit(200).lean()
+    const list = await db().select().from(overtime).orderBy(desc(overtime.date)).limit(200)
     const emps = await employeeIndex(list.map((o) => o.employeeId))
-    return list.map((o) => apayOvertime(o, emps.get(String(o.employeeId))))
+    return list.map((o) => apayOvertime(o, emps.get(o.employeeId)))
   }),
 )
 
@@ -274,13 +281,13 @@ apayRouter.post(
   requirePermission('overtime.decide'),
   handler(async (req) => {
     const { status } = parse(decisionSchema, req.body)
-    const o = await Overtime.findOneAndUpdate(
-      { _id: objectId(req.params.id, 'Overtime request'), status: 'pending' },
-      { $set: { status, decidedBy: auth(req).name } },
-      { new: true },
-    ).lean()
+    const [o] = await db()
+      .update(overtime)
+      .set({ status, decidedBy: auth(req).name })
+      .where(and(eq(overtime.id, uuid(req.params.id, 'Overtime request')), eq(overtime.status, 'pending')))
+      .returning()
     if (!o) throw notFound('Pending overtime request')
-    const emp = (await employeeIndex([o.employeeId])).get(String(o.employeeId))
+    const emp = (await employeeIndex([o.employeeId])).get(o.employeeId)
     await notify([o.employeeId], {
       kind: 'request',
       title: `Overtime ${status}`,
@@ -297,9 +304,9 @@ apayRouter.post(
 apayRouter.get(
   '/leaves',
   handler(async () => {
-    const list = await Leave.find().sort({ start: -1 }).limit(300).lean()
+    const list = await db().select().from(leaves).orderBy(desc(leaves.startDate)).limit(300)
     const emps = await employeeIndex(list.map((l) => l.employeeId))
-    return list.map((l) => apayLeave(l, emps.get(String(l.employeeId))))
+    return list.map((l) => apayLeave(l, emps.get(l.employeeId)))
   }),
 )
 
@@ -308,19 +315,19 @@ apayRouter.post(
   requirePermission('attendance.manage'),
   handler(async (req) => {
     const { status } = parse(decisionSchema, req.body)
-    const l = await Leave.findOneAndUpdate(
-      { _id: objectId(req.params.id, 'Leave'), status: 'pending' },
-      { $set: { status, decidedBy: auth(req).name } },
-      { new: true },
-    ).lean()
+    const [l] = await db()
+      .update(leaves)
+      .set({ status, decidedBy: auth(req).name })
+      .where(and(eq(leaves.id, uuid(req.params.id, 'Leave')), eq(leaves.status, 'pending')))
+      .returning()
     if (!l) throw notFound('Pending leave')
+    const emp = (await employeeIndex([l.employeeId])).get(l.employeeId)
     await notify([l.employeeId], {
       kind: 'leave',
       title: `Leave ${status}`,
       body: `Your ${l.days}-day ${l.type} leave was ${status}.`,
       link: '/app/leaves',
     })
-    const emp = (await employeeIndex([l.employeeId])).get(String(l.employeeId))
     await audit(req, status === 'approved' ? 'Approved leave' : 'Rejected leave', emp ? `${emp.firstName} ${emp.lastName}` : '')
     return apayLeave(l, emp)
   }),
@@ -338,32 +345,35 @@ const announcementSchema = z.object({
 
 apayRouter.get(
   '/announcements',
-  handler(async () => (await Announcement.find().sort({ publishedAt: -1 }).limit(100).lean()).map(apayAnnouncement)),
+  handler(async () => (await db().select().from(announcements).orderBy(desc(announcements.publishedAt)).limit(100)).map(apayAnnouncement)),
 )
 
 async function saveAnnouncement(req: Request, id?: string) {
   const input = parse(announcementSchema, req.body)
-  const existing = id ? await Announcement.findById(id) : null
+  const [existing] = id ? await db().select().from(announcements).where(eq(announcements.id, id)) : []
   if (id && !existing) throw notFound('Announcement')
-  const wasPublished = existing?.status === 'published'
-  const doc = existing ?? new Announcement({ author: auth(req).name })
-  doc.set(input)
-  if (input.status === 'published' && !wasPublished) doc.publishedAt = new Date()
-  await doc.save()
+  const publishing = input.status === 'published' && existing?.status !== 'published'
+  const values = { ...input, ...(publishing ? { publishedAt: new Date() } : {}) }
 
-  if (input.status === 'published' && !wasPublished) {
-    const audience = await Employee.find(
-      input.audience === 'all' ? { status: { $ne: 'resigned' } } : { department: input.audience, status: { $ne: 'resigned' } },
-    )
-      .select('_id')
-      .lean()
+  const [doc] = existing
+    ? await db().update(announcements).set(values).where(eq(announcements.id, existing.id)).returning()
+    : await db()
+        .insert(announcements)
+        .values({ ...values, author: auth(req).name })
+        .returning()
+
+  if (publishing) {
+    const audience = await db()
+      .select({ id: employees.id })
+      .from(employees)
+      .where(and(ne(employees.status, 'resigned'), input.audience === 'all' ? undefined : eq(employees.department, input.audience)))
     await notify(
-      audience.map((e) => e._id),
-      { kind: 'announcement', title: `New announcement: ${input.category}`, body: input.title, link: `/app/announcements/${doc._id}` },
+      audience.map((e) => e.id),
+      { kind: 'announcement', title: `New announcement: ${input.category}`, body: input.title, link: `/app/announcements/${doc.id}` },
     )
   }
   await audit(req, input.status === 'published' ? 'Published announcement' : 'Saved announcement draft', input.title)
-  return apayAnnouncement(doc.toObject())
+  return apayAnnouncement(doc)
 }
 
 apayRouter.post(
@@ -379,7 +389,7 @@ apayRouter.post(
 apayRouter.put(
   '/announcements/:id',
   requireAny('announcements.manage', 'payroll.process'),
-  handler((req) => saveAnnouncement(req, objectId(req.params.id, 'Announcement'))),
+  handler((req) => saveAnnouncement(req, uuid(req.params.id, 'Announcement'))),
 )
 
 /* --------------------------------- Settings --------------------------------- */
@@ -414,5 +424,5 @@ apayRouter.put(
 
 apayRouter.get(
   '/audit',
-  handler(async () => (await Audit.find().sort({ createdAt: -1 }).limit(100).lean()).map(apayAudit)),
+  handler(async () => (await db().select().from(auditLog).orderBy(desc(auditLog.createdAt)).limit(100)).map(apayAudit)),
 )

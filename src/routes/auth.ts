@@ -1,8 +1,10 @@
 import { Router } from 'express'
 import bcrypt from 'bcryptjs'
 import { rateLimit } from 'express-rate-limit'
+import { and, eq } from 'drizzle-orm'
 import { z } from 'zod'
-import { Employee, User } from '../models/index.js'
+import { db } from '../db/index.js'
+import { employees, users } from '../db/schema.js'
 import { HttpError, forbidden, handler, parse } from '../lib/http.js'
 import { roleLabels, type StaffRole } from '../lib/permissions.js'
 import { signToken } from '../middleware/auth.js'
@@ -35,34 +37,30 @@ authRouter.post(
   loginLimiter,
   handler(async (req) => {
     const { email, password, app } = parse(loginSchema, req.body)
-    const user = await User.findOne({ email: email.toLowerCase(), active: true }).select('+passwordHash')
+    const [user] = await db()
+      .select()
+      .from(users)
+      .where(and(eq(users.email, email.toLowerCase()), eq(users.active, true)))
     const ok = await bcrypt.compare(password, user?.passwordHash ?? DUMMY_HASH)
     if (!user || !ok) throw new HttpError(401, 'Incorrect email or password')
 
+    const touch = () => db().update(users).set({ lastLoginAt: new Date() }).where(eq(users.id, user.id))
+
     if (app === 'apay') {
       if (user.role === 'employee') throw forbidden('APAY is for HR, Payroll, Finance and authorized management only')
-      user.lastLoginAt = new Date()
-      await user.save()
-      const ctx = {
-        userId: String(user._id),
-        name: user.name,
-        role: user.role,
-        employeeId: user.employeeId ? String(user.employeeId) : undefined,
-        app,
-      } as const
+      await touch()
       return {
-        token: signToken(ctx),
-        user: { id: String(user._id), name: user.name, email: user.email, role: user.role, title: user.title || roleLabels[user.role as StaffRole] },
+        token: signToken({ userId: user.id, name: user.name, role: user.role, employeeId: user.employeeId ?? undefined, app }),
+        user: { id: user.id, name: user.name, email: user.email, role: user.role, title: user.title || roleLabels[user.role as StaffRole] },
       }
     }
 
     // AZONE: any account linked to an employee record
-    const employee = user.employeeId ? await Employee.findById(user.employeeId).lean() : null
+    const [employee] = user.employeeId ? await db().select().from(employees).where(eq(employees.id, user.employeeId)) : []
     if (!employee || employee.status === 'resigned') throw forbidden('Your account is not linked to an active employee record')
-    user.lastLoginAt = new Date()
-    await user.save()
+    await touch()
     return {
-      token: signToken({ userId: String(user._id), name: user.name, role: user.role, employeeId: String(employee._id), app }),
+      token: signToken({ userId: user.id, name: user.name, role: user.role, employeeId: employee.id, app }),
       employee: azoneEmployee(employee),
     }
   }),

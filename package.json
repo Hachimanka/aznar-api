@@ -2,7 +2,7 @@
   "name": "aznar-api",
   "private": true,
   "version": "0.1.0",
-  "description": "Aznar API — shared backend for AZONE and APAY (Express + MongoDB)",
+  "description": "Aznar API - shared backend for AZONE and APAY (Express + Supabase Postgres)",
   "type": "module",
   "engines": {
     "node": ">=20"
@@ -10,6 +10,8 @@
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "start": "tsx src/server.ts",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "tsx src/db/migrate.ts",
     "seed": "tsx src/seed/run.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
@@ -20,21 +22,23 @@
     "date-fns": "^4.4.0",
     "decimal.js": "^10.6.0",
     "dotenv": "^18.0.5",
+    "drizzle-orm": "^0.45.3",
     "express": "^5.2.1",
     "express-rate-limit": "^8.7.0",
     "helmet": "^8.3.0",
     "jsonwebtoken": "^9.0.3",
-    "mongoose": "^9.10.3",
+    "postgres": "^3.4.9",
     "zod": "^4.6.5"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "^0.5.8",
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
     "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^26.6.4",
     "@types/supertest": "^7.2.1",
     "@vercel/node": "^17.0.0",
-    "mongodb-memory-server": "^11.3.0",
+    "drizzle-kit": "^0.31.11",
     "supertest": "^7.3.0",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2",

@@ -1,5 +1,4 @@
 import type { NextFunction, Request, RequestHandler, Response } from 'express'
-import mongoose from 'mongoose'
 import { z } from 'zod'
 
 export class HttpError extends Error {
@@ -23,9 +22,11 @@ export function parse<T extends z.ZodType>(schema: T, data: unknown): z.infer<T>
   return result.data
 }
 
-/** Validate a route id param as an ObjectId (prevents casting errors and query injection). */
-export function objectId(value: unknown, what = 'Resource') {
-  if (typeof value !== 'string' || !mongoose.isValidObjectId(value)) throw notFound(what)
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+/** Validate a route id param as a UUID; anything else is simply "not found". */
+export function uuid(value: unknown, what = 'Resource') {
+  if (typeof value !== 'string' || !UUID.test(value)) throw notFound(what)
   return value
 }
 
