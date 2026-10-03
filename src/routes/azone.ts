@@ -1,13 +1,23 @@
 import { Router } from 'express'
-import { and, desc, eq, gte, inArray, lte, ne, or } from 'drizzle-orm'
+import { and, desc, eq, gte, inArray, lt, lte, ne, or, sql } from 'drizzle-orm'
 import { z } from 'zod'
 import { db } from '../db/index.js'
-import { announcements, attendance, employeeRequests, employees, leaves, notifications, payrollLines, payrollPeriods } from '../db/schema.js'
+import {
+  announcements,
+  attendance,
+  employeeAvatars,
+  employeeRequests,
+  employees,
+  leaves,
+  notifications,
+  payrollLines,
+  payrollPeriods,
+} from '../db/schema.js'
 import { badRequest, conflict, handler, isoDay, notFound, parse, uuid } from '../lib/http.js'
 import { eachDay, isWeekend, lastDayOfMonth, manilaDate } from '../lib/dates.js'
 import { employeeIdOf, requireAuth } from '../middleware/auth.js'
 import { employeeDays } from '../services/attendance.js'
-import { getHolidays, getSetting, type CompanyInfo } from '../services/core.js'
+import { getAvatar, getHolidays, getSetting, type CompanyInfo } from '../services/core.js'
 import { azoneAnnouncement, azoneDay, azoneEmployee, azoneLeave, azoneNotification, azonePayslip, azoneRequest } from '../services/serializers.js'
 
 /** Employee self-service. Every route acts only on the signed-in employee's own data. */
@@ -24,7 +34,7 @@ async function me(employeeId: string) {
 
 azoneRouter.get(
   '/me',
-  handler(async (req) => azoneEmployee(await me(employeeIdOf(req)))),
+  handler(async (req) => azoneEmployee(await me(employeeIdOf(req)), await getAvatar(employeeIdOf(req)))),
 )
 
 const contactSchema = z.object({
@@ -53,7 +63,49 @@ azoneRouter.patch(
       .where(eq(employees.id, employeeIdOf(req)))
       .returning()
     if (!e) throw notFound('Employee')
-    return azoneEmployee(e)
+    return azoneEmployee(e, await getAvatar(e.id))
+  }),
+)
+
+/** AZONE crops and resizes to 256px before upload; the cap keeps the request under the 100kb JSON body limit. */
+const MAX_AVATAR_CHARS = 90_000
+const avatarSchema = z.object({
+  dataUrl: z
+    .string()
+    .max(MAX_AVATAR_CHARS, 'Image is too large')
+    .regex(/^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/]+=*$/, 'Must be a JPEG, PNG or WebP image'),
+})
+
+/** Check the bytes really are the claimed image type (the data URL prefix alone is just a label). */
+function isRealImage(dataUrl: string) {
+  const [, type, b64] = /^data:image\/(\w+);base64,(.*)$/.exec(dataUrl) ?? []
+  const head = Buffer.from(b64?.slice(0, 24) ?? '', 'base64')
+  if (type === 'jpeg') return head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff
+  if (type === 'png') return head.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
+  if (type === 'webp') return head.toString('latin1', 0, 4) === 'RIFF' && head.toString('latin1', 8, 12) === 'WEBP'
+  return false
+}
+
+azoneRouter.put(
+  '/me/avatar',
+  handler(async (req) => {
+    const { dataUrl } = parse(avatarSchema, req.body)
+    if (!isRealImage(dataUrl)) throw badRequest('Must be a JPEG, PNG or WebP image')
+    const employeeId = employeeIdOf(req)
+    await db()
+      .insert(employeeAvatars)
+      .values({ employeeId, dataUrl })
+      .onConflictDoUpdate({ target: employeeAvatars.employeeId, set: { dataUrl, updatedAt: new Date() } })
+    return azoneEmployee(await me(employeeId), dataUrl)
+  }),
+)
+
+azoneRouter.delete(
+  '/me/avatar',
+  handler(async (req) => {
+    const employeeId = employeeIdOf(req)
+    await db().delete(employeeAvatars).where(eq(employeeAvatars.employeeId, employeeId))
+    return azoneEmployee(await me(employeeId), null)
   }),
 )
 
@@ -320,18 +372,20 @@ azoneRouter.get(
 
 /* ------------------------------- Notifications ------------------------------- */
 
+/** Notifications are kept for this many days, then deleted. */
+export const NOTIFICATION_RETENTION_DAYS = 30
+
 azoneRouter.get(
   '/notifications',
-  handler(async (req) =>
-    (
-      await db()
-        .select()
-        .from(notifications)
-        .where(eq(notifications.employeeId, employeeIdOf(req)))
-        .orderBy(desc(notifications.createdAt))
-        .limit(50)
-    ).map(azoneNotification),
-  ),
+  handler(async (req) => {
+    const mine = eq(notifications.employeeId, employeeIdOf(req))
+    // Purge on read: expired notifications are deleted the next time the employee loads them,
+    // so the bell never shows anything older than the retention window. Uses notifications_employee_idx.
+    await db()
+      .delete(notifications)
+      .where(and(mine, lt(notifications.createdAt, sql`now() - make_interval(days => ${NOTIFICATION_RETENTION_DAYS})`)))
+    return (await db().select().from(notifications).where(mine).orderBy(desc(notifications.createdAt)).limit(50)).map(azoneNotification)
+  }),
 )
 
 azoneRouter.post(

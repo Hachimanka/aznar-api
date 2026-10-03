@@ -1,6 +1,6 @@
 import { and, between, eq, gte, inArray, lte } from 'drizzle-orm'
 import { db, type Exec } from '../db/index.js'
-import { attendance, leaves, overtime } from '../db/schema.js'
+import { attendance, attendanceOverrides, leaves, overtime } from '../db/schema.js'
 import { eachDay, isWeekend, manilaDate, manilaMinutes } from '../lib/dates.js'
 import type { OvertimeKind } from '../lib/payroll.js'
 import { getHolidays, getPayrollSettings } from './core.js'
@@ -79,6 +79,8 @@ export type PeriodAttendance = {
   unpaidLeaveDays: number
   overtime: { kind: OvertimeKind; hours: number }[]
   overtimeHours: number
+  /** Where the day counts came from: daily records, or HR's edit/upload for this cut-off */
+  source: 'dtr' | 'manual' | 'upload'
 }
 
 /**
@@ -119,6 +121,7 @@ export async function periodAttendance(employeeIds: string[], start: string, end
       unpaidLeaveDays: 0,
       overtime: [],
       overtimeHours: 0,
+      source: 'dtr',
     }
     for (const day of workdays) {
       const leave = coveredBy(day, mine)
@@ -137,4 +140,26 @@ export async function periodAttendance(employeeIds: string[], start: string, end
     out.set(id, s)
   }
   return out
+}
+
+/**
+ * The cut-off summary payroll actually uses: DTR-derived, with HR's edited/uploaded rows taking precedence.
+ * Overtime always comes from approved filings — it carries per-kind multipliers an override can't express.
+ */
+export async function cutoffAttendance(period: { id: string; startDate: string; endDate: string }, employeeIds: string[], q: Exec = db()) {
+  const [summary, overrides] = await Promise.all([
+    periodAttendance(employeeIds, period.startDate, period.endDate, q),
+    employeeIds.length ? q.select().from(attendanceOverrides).where(eq(attendanceOverrides.periodId, period.id)) : Promise.resolve([]),
+  ])
+  for (const o of overrides) {
+    const s = summary.get(o.employeeId)
+    if (!s) continue
+    s.daysPresent = o.daysPresent
+    s.absentDays = o.absentDays
+    s.lateMinutes = o.lateMinutes
+    s.paidLeaveDays = o.paidLeaveDays
+    s.unpaidLeaveDays = o.unpaidLeaveDays
+    s.source = o.source
+  }
+  return summary
 }

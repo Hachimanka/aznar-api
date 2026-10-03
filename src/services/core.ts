@@ -1,7 +1,7 @@
 import type { Request } from 'express'
 import { eq } from 'drizzle-orm'
 import { db, type Exec } from '../db/index.js'
-import { auditLog, notifications, settings } from '../db/schema.js'
+import { auditLog, employeeAvatars, notifications, settings } from '../db/schema.js'
 
 /* --------------------------------- Settings --------------------------------- */
 
@@ -76,4 +76,12 @@ type NotificationInput = {
 export async function notify(employeeIds: string[], n: NotificationInput, q: Exec = db()) {
   if (!employeeIds.length) return
   await q.insert(notifications).values(employeeIds.map((employeeId) => ({ employeeId, ...n })))
+}
+
+/* ----------------------------- Profile pictures ----------------------------- */
+
+/** The employee's profile picture as a data URL, or null when they haven't uploaded one. */
+export async function getAvatar(employeeId: string, q: Exec = db()) {
+  const [row] = await q.select({ dataUrl: employeeAvatars.dataUrl }).from(employeeAvatars).where(eq(employeeAvatars.employeeId, employeeId))
+  return row?.dataUrl ?? null
 }

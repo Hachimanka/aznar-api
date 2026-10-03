@@ -6,8 +6,9 @@ import { z } from 'zod'
 import { db } from '../db/index.js'
 import { employees, users } from '../db/schema.js'
 import { HttpError, forbidden, handler, parse } from '../lib/http.js'
-import { roleLabels, type StaffRole } from '../lib/permissions.js'
+import { roleLabels, staffRoles, type StaffRole } from '../lib/permissions.js'
 import { signToken } from '../middleware/auth.js'
+import { getAvatar } from '../services/core.js'
 import { azoneEmployee } from '../services/serializers.js'
 
 export const authRouter = Router()
@@ -25,7 +26,7 @@ const loginSchema = z.object({
   email: z.email().max(254),
   password: z.string().min(1).max(200),
   app: z.enum(['azone', 'apay']),
-  // APAY's demo role picker sends this; the API ignores it — the role always comes from the account
+  // Older APAY builds sent a demo role; the API ignores it — the role always comes from the account
   role: z.string().optional(),
 })
 
@@ -47,7 +48,7 @@ authRouter.post(
     const touch = () => db().update(users).set({ lastLoginAt: new Date() }).where(eq(users.id, user.id))
 
     if (app === 'apay') {
-      if (user.role === 'employee') throw forbidden('APAY is for HR, Payroll, Finance and authorized management only')
+      if (!staffRoles.includes(user.role as StaffRole)) throw forbidden('APAY is for the HR department only')
       await touch()
       return {
         token: signToken({ userId: user.id, name: user.name, role: user.role, employeeId: user.employeeId ?? undefined, app }),
@@ -61,7 +62,7 @@ authRouter.post(
     await touch()
     return {
       token: signToken({ userId: user.id, name: user.name, role: user.role, employeeId: employee.id, app }),
-      employee: azoneEmployee(employee),
+      employee: azoneEmployee(employee, await getAvatar(employee.id)),
     }
   }),
 )

@@ -7,7 +7,7 @@ import { cutoffFor, manilaDate, periodLabel } from '../lib/dates.js'
 import { money } from '../lib/money.js'
 import { badRequest, conflict, forbidden, notFound } from '../lib/http.js'
 import { can, type Role } from '../lib/permissions.js'
-import { periodAttendance } from './attendance.js'
+import { cutoffAttendance } from './attendance.js'
 import { notify } from './core.js'
 
 export type PeriodStatus = (typeof periodStatus)[number]
@@ -39,7 +39,7 @@ export async function computePeriod(periodId: string, actor: { userId?: string }
     .where(and(ne(employees.status, 'resigned'), lte(employees.hireDate, period.endDate)))
   const ids = staff.map((e) => e.id)
   const [summary, adj] = await Promise.all([
-    periodAttendance(ids, period.startDate, period.endDate, q),
+    cutoffAttendance(period, ids, q),
     ids.length
       ? q
           .select()
@@ -124,13 +124,30 @@ export async function computePeriod(periodId: string, actor: { userId?: string }
   return updated
 }
 
+/**
+ * Lock a cut-off before its attendance changes. Only draft/computed payrolls accept edits; a computed one
+ * goes back to draft (lines cleared) so it can't move to review with numbers from the old attendance.
+ */
+export async function reopenForAttendance(periodId: string, tx: Tx) {
+  const period = await lockPeriod(tx, periodId)
+  if (period.status !== 'draft' && period.status !== 'computed') throw conflict(`Attendance of a ${period.status} payroll can no longer be changed`)
+  if (period.status === 'computed') {
+    await tx.delete(payrollLines).where(eq(payrollLines.periodId, period.id))
+    await tx
+      .update(payrollPeriods)
+      .set({ status: 'draft', headcount: 0, gross: '0', deductions: '0', net: '0', employerContributions: '0', computedAt: null, computedById: null })
+      .where(eq(payrollPeriods.id, period.id))
+  }
+  return period
+}
+
 const transitions: Partial<Record<PeriodStatus, PeriodStatus[]>> = {
   computed: ['review'],
   review: ['computed', 'approved'],
   approved: ['released'],
 }
 
-/** Move a period through review → approval → release, enforcing roles and maker–checker. Run inside a transaction. */
+/** Move a period through review → approval → release, enforcing permissions (HR runs every step). Run inside a transaction. */
 export async function transitionPeriod(periodId: string, to: PeriodStatus, actor: { userId: string; name: string; role: Role }, tx: Tx) {
   const period = await lockPeriod(tx, periodId)
   if (!transitions[period.status]?.includes(to)) throw conflict(`Cannot move payroll from ${period.status} to ${to}`)
@@ -140,7 +157,6 @@ export async function transitionPeriod(periodId: string, to: PeriodStatus, actor
   if (to === 'computed' && !can(actor.role, 'payroll.process') && !can(actor.role, 'payroll.approve')) throw forbidden()
   if (to === 'approved') {
     if (!can(actor.role, 'payroll.approve')) throw forbidden()
-    if (period.computedById === actor.userId) throw forbidden('The person who computed this payroll cannot approve it')
     patch.approvedBy = actor.name
     patch.approvedById = actor.userId
   }

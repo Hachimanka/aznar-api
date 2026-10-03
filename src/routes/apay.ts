@@ -1,14 +1,14 @@
 import { Router, type Request } from 'express'
-import { and, asc, desc, eq, inArray, lte, ne } from 'drizzle-orm'
+import { and, asc, desc, eq, inArray, lte, ne, sql } from 'drizzle-orm'
 import { z } from 'zod'
-import { db } from '../db/index.js'
-import { adjustments, announcements, auditLog, employees, leaves, overtime, payrollLines, payrollPeriods } from '../db/schema.js'
-import { forbidden, handler, isoDay, notFound, parse, pesoString, uuid } from '../lib/http.js'
+import { db, type Exec } from '../db/index.js'
+import { adjustments, announcements, attendanceOverrides, auditLog, employees, leaves, overtime, payrollLines, payrollPeriods } from '../db/schema.js'
+import { badRequest, forbidden, handler, isoDay, notFound, parse, pesoString, uuid } from '../lib/http.js'
 import { staffRoles, type StaffRole } from '../lib/permissions.js'
 import { auth, requireAny, requireAuth, requirePermission } from '../middleware/auth.js'
-import { periodAttendance } from '../services/attendance.js'
+import { cutoffAttendance } from '../services/attendance.js'
 import { audit, getPayrollSettings, notify, saveSetting } from '../services/core.js'
-import { computePeriod, ensureCurrentPeriod, transitionPeriod } from '../services/payroll.js'
+import { computePeriod, ensureCurrentPeriod, reopenForAttendance, transitionPeriod } from '../services/payroll.js'
 import { apayAdjustment, apayAnnouncement, apayAudit, apayEmployee, apayLeave, apayLine, apayOvertime, apayPeriod } from '../services/serializers.js'
 
 /** HR / payroll operations. Staff accounts only; each write checks a permission. */
@@ -129,35 +129,119 @@ apayRouter.get(
   handler(async (req) => apayPeriod(await findPeriod(req))),
 )
 
+async function attendanceRows(p: typeof payrollPeriods.$inferSelect, q: Exec = db()) {
+  const staff = await q
+    .select()
+    .from(employees)
+    .where(and(ne(employees.status, 'resigned'), lte(employees.hireDate, p.endDate)))
+    .orderBy(asc(employees.lastName))
+  const summary = await cutoffAttendance(
+    p,
+    staff.map((e) => e.id),
+    q,
+  )
+  return staff.map((e) => {
+    const s = summary.get(e.id)!
+    return {
+      employeeId: e.id,
+      employeeNo: e.employeeNo,
+      name: `${e.firstName} ${e.lastName}`,
+      department: e.department,
+      workingDays: s.workingDays,
+      daysPresent: s.daysPresent,
+      absentDays: s.absentDays,
+      lateMinutes: s.lateMinutes,
+      overtimeHours: s.overtimeHours,
+      paidLeaveDays: s.paidLeaveDays,
+      unpaidLeaveDays: s.unpaidLeaveDays,
+      source: s.source,
+    }
+  })
+}
+
 apayRouter.get(
   '/periods/:id/attendance',
-  handler(async (req) => {
-    const p = await findPeriod(req)
-    const staff = await db()
-      .select()
-      .from(employees)
-      .where(and(ne(employees.status, 'resigned'), lte(employees.hireDate, p.endDate)))
-      .orderBy(asc(employees.lastName))
-    const summary = await periodAttendance(
-      staff.map((e) => e.id),
-      p.startDate,
-      p.endDate,
+  handler(async (req) => attendanceRows(await findPeriod(req))),
+)
+
+const halfDays = z.number().min(0).max(31).multipleOf(0.5, 'Use whole or half days')
+const attendanceSchema = z.object({
+  source: z.enum(['manual', 'upload']),
+  rows: z
+    .array(
+      z.object({
+        employeeId: z.string(),
+        daysPresent: halfDays,
+        absentDays: halfDays,
+        lateMinutes: z.number().int().min(0).max(10_000),
+        paidLeaveDays: halfDays,
+        unpaidLeaveDays: halfDays,
+      }),
     )
-    return staff.map((e) => {
-      const s = summary.get(e.id)!
-      return {
-        employeeId: e.id,
-        employeeNo: e.employeeNo,
-        name: `${e.firstName} ${e.lastName}`,
-        department: e.department,
-        workingDays: s.workingDays,
-        daysPresent: s.daysPresent,
-        absentDays: s.absentDays,
-        lateMinutes: s.lateMinutes,
-        overtimeHours: s.overtimeHours,
-        paidLeaveDays: s.paidLeaveDays,
-        unpaidLeaveDays: s.unpaidLeaveDays,
+    .min(1)
+    .max(2000),
+})
+
+/** HR edits one row or uploads a whole cut-off; these replace the DTR summary for those employees. */
+apayRouter.put(
+  '/periods/:id/attendance',
+  requirePermission('attendance.manage'),
+  handler(async (req) => {
+    const { source, rows } = parse(attendanceSchema, req.body)
+    const id = uuid(req.params.id, 'Payroll period')
+    const a = auth(req)
+    return db().transaction(async (tx) => {
+      const p = await reopenForAttendance(id, tx)
+      const current = new Map((await attendanceRows(p, tx)).map((r) => [r.employeeId, r]))
+      const problems: string[] = []
+      for (const r of rows) {
+        const cur = current.get(r.employeeId)
+        if (!cur) problems.push(`Unknown or inactive employee (${r.employeeId})`)
+        else if (r.daysPresent + r.absentDays + r.paidLeaveDays + r.unpaidLeaveDays !== cur.workingDays)
+          problems.push(`${cur.name}: present + absent + leave must equal ${cur.workingDays} working days`)
       }
+      if (problems.length) throw badRequest(problems.slice(0, 5).join('; ') + (problems.length > 5 ? ` (+${problems.length - 5} more)` : ''))
+
+      await tx
+        .insert(attendanceOverrides)
+        .values(rows.map((r) => ({ ...r, periodId: p.id, source, updatedById: a.userId })))
+        .onConflictDoUpdate({
+          target: [attendanceOverrides.periodId, attendanceOverrides.employeeId],
+          set: {
+            daysPresent: sql`excluded.days_present`,
+            absentDays: sql`excluded.absent_days`,
+            lateMinutes: sql`excluded.late_minutes`,
+            paidLeaveDays: sql`excluded.paid_leave_days`,
+            unpaidLeaveDays: sql`excluded.unpaid_leave_days`,
+            source: sql`excluded.source`,
+            updatedById: sql`excluded.updated_by_id`,
+            updatedAt: new Date(),
+          },
+        })
+      const target = source === 'upload' ? `${p.label} · ${rows.length} employees` : `${p.label} · ${current.get(rows[0].employeeId)!.name}`
+      await audit(req, source === 'upload' ? 'Uploaded attendance' : 'Edited attendance', target, tx)
+      return attendanceRows(p, tx)
+    })
+  }),
+)
+
+/** Drop HR's override so the employee's cut-off goes back to the DTR-derived numbers. */
+apayRouter.delete(
+  '/periods/:id/attendance/:employeeId',
+  requirePermission('attendance.manage'),
+  handler(async (req) => {
+    const id = uuid(req.params.id, 'Payroll period')
+    const employeeId = uuid(req.params.employeeId, 'Employee')
+    return db().transaction(async (tx) => {
+      const p = await reopenForAttendance(id, tx)
+      const [gone] = await tx
+        .delete(attendanceOverrides)
+        .where(and(eq(attendanceOverrides.periodId, p.id), eq(attendanceOverrides.employeeId, employeeId)))
+        .returning()
+      if (!gone) throw notFound('Attendance override')
+      const rows = await attendanceRows(p, tx)
+      await audit(req, 'Reset attendance to DTR', `${p.label} · ${rows.find((r) => r.employeeId === employeeId)?.name ?? ''}`, tx)
+      return rows
     })
   }),
 )

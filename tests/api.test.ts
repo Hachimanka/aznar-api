@@ -1,7 +1,10 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import request from 'supertest'
 import { createApp } from '../src/app.js'
-import { connectMemoryDb, disconnectDb } from '../src/db/index.js'
+import bcrypt from 'bcryptjs'
+import { connectMemoryDb, db, disconnectDb } from '../src/db/index.js'
+import { users } from '../src/db/schema.js'
+import { signToken } from '../src/middleware/auth.js'
 import { seedDatabase } from '../src/seed/seed.js'
 import { sum } from '../src/lib/payroll.js'
 
@@ -101,9 +104,9 @@ describe('AZONE', () => {
 })
 
 describe('APAY payroll cycle', () => {
-  let admin: string, finance: string, hr: string
+  let hr: string
   beforeAll(async () => {
-    ;[admin, finance, hr] = await Promise.all([login('payroll@aznar.com', 'apay'), login('finance@aznar.com', 'apay'), login('hr@aznar.com', 'apay')])
+    hr = await login('hr@aznar.com', 'apay')
   })
   const as = (token: string) => ({
     get: (path: string) => request(app).get(path).set('Authorization', `Bearer ${token}`),
@@ -114,37 +117,86 @@ describe('APAY payroll cycle', () => {
         .send(body ?? {}),
   })
 
-  it('runs compute → review → approve → release with role checks and maker–checker', async () => {
-    const periods = (await as(admin).get('/apay/periods')).body
+  it('is HR-only: other staff accounts can’t sign in, and their old tokens are refused', async () => {
+    const passwordHash = await bcrypt.hash(PASSWORD, 4)
+    for (const role of ['payroll_admin', 'finance', 'management'] as const) {
+      const [u] = await db().insert(users).values({ email: `${role}@aznar.com`, passwordHash, name: role, role }).returning()
+      const res = await request(app).post('/auth/login').send({ email: u.email, password: PASSWORD, app: 'apay' })
+      expect(res.status).toBe(403)
+      expect(res.body.message).toBe('APAY is for the HR department only')
+      const oldToken = signToken({ userId: u.id, name: u.name, role, app: 'apay' })
+      expect((await as(oldToken).get('/apay/periods')).status).toBe(403)
+    }
+  })
+
+  it('lets HR edit/upload cut-off attendance that payroll then uses', async () => {
+    const open = (await as(hr).get('/apay/periods')).body.find((p: { status: string }) => p.status === 'draft')
+    const put = (body: object) => request(app).put(`/apay/periods/${open.id}/attendance`).set('Authorization', `Bearer ${hr}`).send(body)
+    const rows = (await as(hr).get(`/apay/periods/${open.id}/attendance`)).body
+    const leo = rows.find((r: { name: string }) => r.name === 'Leonard Forrosuelo')
+    expect(leo.source).toBe('dtr')
+    const edit = {
+      employeeId: leo.employeeId,
+      daysPresent: leo.workingDays - 2,
+      absentDays: 2,
+      lateMinutes: 30,
+      paidLeaveDays: 0,
+      unpaidLeaveDays: 0,
+    }
+
+    // Day counts must add up to the working days
+    expect((await put({ source: 'manual', rows: [{ ...edit, absentDays: 3 }] })).status).toBe(400)
+
+    // Editing a computed payroll sends it back to draft so stale numbers can't be approved
+    await as(hr).post(`/apay/periods/${open.id}/compute`)
+    const saved = await put({ source: 'manual', rows: [edit] })
+    expect(saved.status, JSON.stringify(saved.body)).toBe(200)
+    expect(saved.body.find((r: { employeeId: string }) => r.employeeId === leo.employeeId)).toMatchObject({ absentDays: 2, lateMinutes: 30, source: 'manual' })
+    expect((await as(hr).get(`/apay/periods/${open.id}`)).body.status).toBe('draft')
+    expect((await as(hr).get(`/apay/periods/${open.id}/lines`)).body).toHaveLength(0)
+
+    await as(hr).post(`/apay/periods/${open.id}/compute`)
+    const line = (await as(hr).get(`/apay/periods/${open.id}/lines`)).body.find((l: { employeeId: string }) => l.employeeId === leo.employeeId)
+    expect(line.absencesDeduction).toBe('4597.70') // 2 days × (50,000 × 12 ÷ 261)
+
+    // Reset goes back to the DTR numbers
+    const reset = await request(app).delete(`/apay/periods/${open.id}/attendance/${leo.employeeId}`).set('Authorization', `Bearer ${hr}`)
+    expect(reset.status).toBe(200)
+    expect(reset.body.find((r: { employeeId: string }) => r.employeeId === leo.employeeId)).toMatchObject({ absentDays: leo.absentDays, source: 'dtr' })
+  })
+
+  it('lets HR run compute → review → approve → release on its own', async () => {
+    const periods = (await as(hr).get('/apay/periods')).body
     const open = periods.find((p: { status: string }) => p.status === 'draft')
     expect(open).toBeTruthy()
 
-    // HR cannot compute
-    expect((await as(hr).post(`/apay/periods/${open.id}/compute`)).status).toBe(403)
-
-    const computed = await as(admin).post(`/apay/periods/${open.id}/compute`)
+    const computed = await as(hr).post(`/apay/periods/${open.id}/compute`)
     expect(computed.status, JSON.stringify(computed.body)).toBe(200)
     expect(computed.body.status).toBe('computed')
     expect(computed.body.headcount).toBeGreaterThan(20)
 
-    const lines = (await as(admin).get(`/apay/periods/${open.id}/lines`)).body
+    const lines = (await as(hr).get(`/apay/periods/${open.id}/lines`)).body
     expect(sum(lines.map((l: { netPay: string }) => l.netPay))).toBe(computed.body.net)
 
-    // Cannot skip review
-    expect((await as(finance).post(`/apay/periods/${open.id}/status`, { status: 'approved' })).status).toBe(409)
+    // Steps still can't be skipped
+    expect((await as(hr).post(`/apay/periods/${open.id}/status`, { status: 'approved' })).status).toBe(409)
+    expect((await as(hr).post(`/apay/periods/${open.id}/status`, { status: 'review' })).body.status).toBe('review')
 
-    expect((await as(admin).post(`/apay/periods/${open.id}/status`, { status: 'review' })).body.status).toBe('review')
-    // Payroll Admin lacks approve permission
-    expect((await as(admin).post(`/apay/periods/${open.id}/status`, { status: 'approved' })).status).toBe(403)
-
-    const approved = await as(finance).post(`/apay/periods/${open.id}/status`, { status: 'approved' })
+    // The same HR account that computed it can approve it
+    const approved = await as(hr).post(`/apay/periods/${open.id}/status`, { status: 'approved' })
+    expect(approved.status, JSON.stringify(approved.body)).toBe(200)
     expect(approved.body.status).toBe('approved')
-    expect(approved.body.approvedBy).toBe('Jose Reyes')
+    expect(approved.body.approvedBy).toBe('Ana Cruz')
 
     // Approved payroll is locked
-    expect((await as(admin).post(`/apay/periods/${open.id}/compute`)).status).toBe(409)
+    expect((await as(hr).post(`/apay/periods/${open.id}/compute`)).status).toBe(409)
+    const lockedEdit = await request(app)
+      .put(`/apay/periods/${open.id}/attendance`)
+      .set('Authorization', `Bearer ${hr}`)
+      .send({ source: 'manual', rows: [{ employeeId: lines[0].employeeId, daysPresent: 0, absentDays: 0, lateMinutes: 0, paidLeaveDays: 0, unpaidLeaveDays: 0 }] })
+    expect(lockedEdit.status).toBe(409)
 
-    const released = await as(admin).post(`/apay/periods/${open.id}/status`, { status: 'released' })
+    const released = await as(hr).post(`/apay/periods/${open.id}/status`, { status: 'released' })
     expect(released.body.status).toBe('released')
 
     // The employee now sees the new payslip and a notification in AZONE
@@ -154,20 +206,20 @@ describe('APAY payroll cycle', () => {
     const notes = (await request(app).get('/azone/notifications').set('Authorization', `Bearer ${leonard}`)).body
     expect(notes[0].kind).toBe('payslip')
 
-    expect((await as(admin).get('/apay/audit')).body[0].action).toBe('Released payroll')
+    expect((await as(hr).get('/apay/audit')).body[0].action).toBe('Released payroll')
   })
 
   it('amortizes loans on release', async () => {
-    const loan = (await as(admin).get('/apay/adjustments')).body.find((a: { name: string }) => a.name === 'SSS Salary Loan')
+    const loan = (await as(hr).get('/apay/adjustments')).body.find((a: { name: string }) => a.name === 'SSS Salary Loan')
     expect(loan.balance).toBe('13750.00')
   })
 
-  it('blocks Finance from changing settings', async () => {
+  it('lets HR change settings', async () => {
     const res = await request(app)
       .put('/apay/settings')
-      .set('Authorization', `Bearer ${finance}`)
-      .send({ companyName: 'X', graceMinutes: 5, roundLateTo: 1, requireTwoStepApproval: true, autoPublishToAzone: true })
-    expect(res.status).toBe(403)
+      .set('Authorization', `Bearer ${hr}`)
+      .send({ companyName: 'Aznar', graceMinutes: 5, roundLateTo: 1, requireTwoStepApproval: true, autoPublishToAzone: true })
+    expect(res.status, JSON.stringify(res.body)).toBe(200)
   })
 
   it('publishing an announcement notifies employees', async () => {
@@ -185,7 +237,7 @@ describe('APAY payroll cycle', () => {
   })
 
   it('rejects invalid ids and bodies cleanly', async () => {
-    expect((await as(admin).get('/apay/employees/not-an-id')).status).toBe(404)
-    expect((await as(admin).post('/apay/adjustments', { employeeId: 'x' })).status).toBe(400)
+    expect((await as(hr).get('/apay/employees/not-an-id')).status).toBe(404)
+    expect((await as(hr).post('/apay/adjustments', { employeeId: 'x' })).status).toBe(400)
   })
 })

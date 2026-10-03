@@ -1,9 +1,11 @@
 /** Mirrors apay/src/lib/permissions.ts — the API is the authority, the UI only hides buttons. */
 
+/** Account roles stored in the users table. payroll_admin/finance/management are legacy: they can no longer use APAY. */
 export type StaffRole = 'hr' | 'payroll_admin' | 'finance' | 'management'
 export type Role = StaffRole | 'employee'
 
-export const staffRoles: StaffRole[] = ['hr', 'payroll_admin', 'finance', 'management']
+/** APAY is run by the HR department alone — only HR accounts may sign in or call /apay. */
+export const staffRoles: StaffRole[] = ['hr']
 
 export type Permission =
   | 'employees.manage'
@@ -17,20 +19,24 @@ export type Permission =
   | 'announcements.manage'
   | 'settings.manage'
 
+const allPermissions: Permission[] = [
+  'employees.manage',
+  'attendance.manage',
+  'payroll.process',
+  'payroll.approve',
+  'payroll.release',
+  'adjustments.manage',
+  'overtime.decide',
+  'reports.view',
+  'announcements.manage',
+  'settings.manage',
+]
+
 export const rolePermissions: Record<StaffRole, Permission[]> = {
-  payroll_admin: [
-    'employees.manage',
-    'attendance.manage',
-    'payroll.process',
-    'payroll.release',
-    'adjustments.manage',
-    'overtime.decide',
-    'reports.view',
-    'settings.manage',
-  ],
-  hr: ['employees.manage', 'attendance.manage', 'overtime.decide', 'announcements.manage', 'reports.view'],
-  finance: ['payroll.approve', 'payroll.release', 'reports.view'],
-  management: ['payroll.approve', 'reports.view'],
+  hr: allPermissions,
+  payroll_admin: [],
+  finance: [],
+  management: [],
 }
 
 export const roleLabels: Record<StaffRole, string> = {

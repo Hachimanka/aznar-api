@@ -95,11 +95,9 @@ const company: CompanyInfo = {
   ],
 }
 
+// APAY is run by HR alone, so HR is the only staff login
 const staff = [
-  { email: 'payroll@aznar.com', role: 'payroll_admin', person: 'Kristine Villanueva', title: 'Payroll Specialist' },
   { email: 'hr@aznar.com', role: 'hr', person: 'Ana Cruz', title: 'HR Manager' },
-  { email: 'finance@aznar.com', role: 'finance', person: 'Jose Reyes', title: 'Finance Manager' },
-  { email: 'management@aznar.com', role: 'management', person: 'Nicole Lim', title: 'Sales Manager' },
 ] as const
 
 /**
@@ -369,8 +367,7 @@ export async function seedDatabase({ password, today = manilaDate() }: { passwor
     ])
 
   /* Six released cut-offs, computed by the real engine */
-  const [finance] = await db().select().from(users).where(eq(users.role, 'finance'))
-  const [payroll] = await db().select().from(users).where(eq(users.role, 'payroll_admin'))
+  const [hr] = await db().select().from(users).where(eq(users.role, 'hr'))
   const history: { start: string; end: string }[] = []
   let cut = cutoffFor(addDays(cutoffFor(today).start, -1))
   for (let i = 0; i < 6; i++) {
@@ -380,18 +377,18 @@ export async function seedDatabase({ password, today = manilaDate() }: { passwor
   for (const c of history) {
     const label = periodLabel(c.start, c.end)
     const [p] = await db().insert(payrollPeriods).values({ startDate: c.start, endDate: c.end, label, payDate: c.end }).returning()
-    await db().transaction((tx) => computePeriod(p.id, { userId: payroll.id }, tx))
+    await db().transaction((tx) => computePeriod(p.id, { userId: hr.id }, tx))
     const releasedAt = manilaInstant(c.end, 15, 0)
     await db()
       .update(payrollPeriods)
-      .set({ status: 'released', approvedBy: finance.name, approvedById: finance.id, releasedAt })
+      .set({ status: 'released', approvedBy: hr.name, approvedById: hr.id, releasedAt })
       .where(eq(payrollPeriods.id, p.id))
     await db()
       .insert(auditLog)
       .values([
-        { actor: payroll.name, actorId: payroll.id, action: 'Computed payroll', target: label, createdAt: manilaInstant(addDays(c.end, -2), 10, 0) },
-        { actor: finance.name, actorId: finance.id, action: 'Approved payroll', target: label, createdAt: manilaInstant(addDays(c.end, -1), 14, 0) },
-        { actor: payroll.name, actorId: payroll.id, action: 'Released payroll', target: label, createdAt: releasedAt },
+        { actor: hr.name, actorId: hr.id, action: 'Computed payroll', target: label, createdAt: manilaInstant(addDays(c.end, -2), 10, 0) },
+        { actor: hr.name, actorId: hr.id, action: 'Approved payroll', target: label, createdAt: manilaInstant(addDays(c.end, -1), 14, 0) },
+        { actor: hr.name, actorId: hr.id, action: 'Released payroll', target: label, createdAt: releasedAt },
       ])
   }
   await ensureCurrentPeriod(today)

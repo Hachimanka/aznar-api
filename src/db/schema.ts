@@ -250,6 +250,27 @@ export const payrollLines = pgTable(
   (t) => [uniqueIndex('payroll_lines_period_employee_uq').on(t.periodId, t.employeeId), index('payroll_lines_employee_idx').on(t.employeeId)],
 ).enableRLS()
 
+/** Cut-off attendance entered by HR (edited or uploaded) — replaces the DTR-derived summary for that employee and period. */
+export const attendanceOverrides = pgTable(
+  'attendance_overrides',
+  {
+    id: id(),
+    periodId: uuid('period_id')
+      .notNull()
+      .references(() => payrollPeriods.id, { onDelete: 'cascade' }),
+    employeeId: employeeRef(),
+    daysPresent: real('days_present').notNull(),
+    absentDays: real('absent_days').notNull(),
+    lateMinutes: integer('late_minutes').notNull(),
+    paidLeaveDays: real('paid_leave_days').notNull(),
+    unpaidLeaveDays: real('unpaid_leave_days').notNull(),
+    source: text('source', { enum: ['manual', 'upload'] }).notNull(),
+    updatedById: uuid('updated_by_id').references(() => users.id),
+    updatedAt: updatedAt(),
+  },
+  (t) => [uniqueIndex('attendance_overrides_period_employee_uq').on(t.periodId, t.employeeId)],
+).enableRLS()
+
 /* -------------------------- Communication & admin -------------------------- */
 
 export const announcements = pgTable(
@@ -309,3 +330,17 @@ export const auditLog = pgTable(
 export type Employee = typeof employees.$inferSelect
 export type PayrollPeriod = typeof payrollPeriods.$inferSelect
 export type PayrollLine = typeof payrollLines.$inferSelect
+
+/* ----------------------------- Profile pictures ----------------------------- */
+
+/**
+ * One small square JPEG/PNG/WebP per employee, stored as a data URL (AZONE resizes to 256px before upload, ~15–40 KB).
+ * Kept out of `employees` so APAY's employee lists don't pull image data.
+ */
+export const employeeAvatars = pgTable('employee_avatars', {
+  employeeId: uuid('employee_id')
+    .primaryKey()
+    .references(() => employees.id, { onDelete: 'cascade' }),
+  dataUrl: text('data_url').notNull(),
+  updatedAt: updatedAt(),
+}).enableRLS()

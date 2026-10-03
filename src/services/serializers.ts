@@ -24,7 +24,7 @@ export function mask(value: string | null | undefined, visible = 3) {
 /* ---------------------------------- AZONE ---------------------------------- */
 
 /** What an employee sees about themselves — no salary, masked government IDs. */
-export function azoneEmployee(e: Employee) {
+export function azoneEmployee(e: Employee, avatarUrl: string | null = null) {
   return {
     id: e.id,
     employeeNo: e.employeeNo,
@@ -43,6 +43,7 @@ export function azoneEmployee(e: Employee) {
     workSchedule: e.workSchedule,
     govIds: { sss: mask(e.sss), philhealth: mask(e.philhealth), pagibig: mask(e.pagibig, 4), tin: mask(e.tin, 6) },
     emergencyContact: { name: e.emergencyName, relation: e.emergencyRelation, phone: e.emergencyPhone },
+    avatarUrl,
   }
 }
 
